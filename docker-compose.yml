@@ -6,6 +6,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.${ARCH}
+    container_name: docker-volume-ipfs
+    hostname: docker-volume-ipfs
     image: sofwerx/docker-volume-ipfs:${ARCH}
     environment:
       ARCH: ${ARCH}

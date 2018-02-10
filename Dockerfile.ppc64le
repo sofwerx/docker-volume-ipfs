@@ -1,8 +1,97 @@
-FROM ppc64le/golang:1.9
+FROM ppc64le/golang:1.9-stretch
+MAINTAINER Ian Blenke <ian@blenke.com>
 
-ADD . /go/src/github.com/sofwerx/docker-volume-ipfs
+RUN go get -v -u github.com/whyrusleeping/gx
+RUN go get -v -u github.com/whyrusleeping/gx-go
+RUN gx -v && gx-go -v
 
-WORKDIR /go/src/github.com/sofwerx/docker-volume-ipfs
+ENV GX_IPFS ""
+RUN go get -u github.com/ipfs/go-ipfs
+
+WORKDIR /go/src/github.com/ipfs/go-ipfs
+RUN gx install --global
+RUN go install -v ./cmd/ipfs
+
+# Get su-exec, a very minimal tool for dropping privileges
+ENV SUEXEC_VERSION v0.2
+
+RUN set -x \
+  && cd /tmp \
+  && git clone https://github.com/ncopa/su-exec.git \
+  && cd su-exec \
+  && git checkout -q $SUEXEC_VERSION \
+  && make
+
+# Get the TLS CA certificates, they're not provided by busybox.
+RUN apt-get update && apt-get install -y ca-certificates
+
+# Now comes the actual target image, which aims to be as small as possible.
+#FROM busybox:1-glibc
+FROM ppc64le/golang:1.9-stretch
+MAINTAINER Ian Blenke <ian@blenke.com>
+
+RUN apt-get update \
+ && apt-get install -y fuse
+
+# Get the ipfs binary, entrypoint script, and TLS CAs from the build container.
+ENV SRC_DIR /go/src/github.com/ipfs/go-ipfs
+COPY --from=0 /go/bin/ipfs /usr/local/bin/ipfs
+COPY --from=0 $SRC_DIR/bin/container_daemon /usr/local/bin/start_ipfs
+COPY --from=0 /tmp/su-exec/su-exec /sbin/su-exec
+# This does not appear to be required
+##COPY --from=0 /tmp/tini /sbin/tini
+COPY --from=0 /etc/ssl/certs /etc/ssl/certs
+
+# This shared lib (part of glibc) doesn't seem to be included with busybox.
+COPY --from=0 /lib/*-linux-gnu/libdl-2.24.so /lib/libdl.so.2
+
+# Ports for Swarm TCP, Swarm uTP, API, Gateway, Swarm Websockets
+EXPOSE 4001
+EXPOSE 4002/udp
+EXPOSE 5001
+EXPOSE 8080
+EXPOSE 8081
+
+# Create the fs-repo directory and switch to a non-privileged user.
+ENV IPFS_PATH /data/ipfs
+#RUN mkdir -p $IPFS_PATH \
+  #&& adduser -D -h $IPFS_PATH -u 1000 -G users ipfs \
+  #&& chown ipfs:users $IPFS_PATH
+RUN mkdir -p $IPFS_PATH /ipfs /ipns \
+  && groupadd -g 1000 fuse \
+  && useradd -g 100 -u 1000 -d $IPFS_PATH ipfs \
+  && id ipfs \
+  && chown ipfs:users $IPFS_PATH /ipfs /ipns \
+  && chgrp fuse /etc/fuse.conf \
+  && chmod g+r  /etc/fuse.conf \
+  && usermod -G fuse -a ipfs
+
+RUN echo user_allow_other >> /etc/fuse.conf
+
+# Expose the fs-repo as a volume.
+# start_ipfs initializes an fs-repo if none is mounted.
+# Important this happens after the USER directive so permission are correct.
+VOLUME $IPFS_PATH
+
+# The default logging level
+ENV IPFS_LOGGING ""
+
+# This just makes sure that:
+# 1. There's an fs-repo, and initializes one if there isn't.
+# 2. The API and Gateway are accessible from outside the container.
+
+RUN mkdir -p $GOPATH/src/github.com/vdemeester/
+ADD . $GOPATH/src/github.com/vdemeester/docker-volume-ipfs/
+
+WORKDIR $GOPATH/src/github.com/vdemeester/docker-volume-ipfs
 
 RUN make
 
+RUN groupadd -g 998 docker \
+  && usermod -G docker -a ipfs
+
+# Support FUSE mount
+VOLUME /ipfs
+VOLUME /ipns
+
+CMD su-exec ipfs /go/src/github.com/vdemeester/docker-volume-ipfs/bin/docker-volume-ipfs
